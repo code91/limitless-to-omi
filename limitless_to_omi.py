@@ -272,15 +272,36 @@ def create_omi_conversation(
             _rate_limiter.wait()
             response = requests.post(url, json=payload, headers=headers, timeout=30)
             if response.status_code == 429:
-                return {"error": "Rate limited. Please wait and try again."}
+                return {"error": "Rate limited (429). Please wait and try again."}
 
-        response.raise_for_status()
+        # Capture detailed error info for non-success responses
+        if not response.ok:
+            error_detail = f"HTTP {response.status_code}"
+            try:
+                error_body = response.json()
+                if isinstance(error_body, dict):
+                    # Handle common API error formats
+                    detail = error_body.get("detail") or error_body.get("message") or error_body.get("error")
+                    if detail:
+                        error_detail = f"HTTP {response.status_code}: {detail}"
+                    else:
+                        error_detail = f"HTTP {response.status_code}: {error_body}"
+                else:
+                    error_detail = f"HTTP {response.status_code}: {error_body}"
+            except (ValueError, json.JSONDecodeError):
+                # Response isn't JSON, use text
+                if response.text:
+                    error_detail = f"HTTP {response.status_code}: {response.text[:200]}"
+            return {"error": error_detail, "status_code": response.status_code}
+
         return response.json()
 
     except requests.exceptions.Timeout:
-        return {"error": "Request timed out"}
+        return {"error": "Request timed out (30s)"}
+    except requests.exceptions.ConnectionError as e:
+        return {"error": f"Connection error: {e}"}
     except requests.exceptions.RequestException as e:
-        return {"error": str(e)}
+        return {"error": f"Request failed: {e}"}
 
 
 def process_file(filepath: Path) -> Dict[str, Any]:
@@ -553,6 +574,8 @@ def import_lifelogs(
     partial_count = 0
     fail_count = 0
     total_convos_created = 0
+    error_messages = {}  # Track error types for summary
+    failed_files = []  # Track failed files for detailed output
     start_time = time.time()
 
     # Use ThreadPoolExecutor for parallel imports
@@ -581,6 +604,16 @@ def import_lifelogs(
             else:
                 fail_count += 1
                 status_char = "✗"
+                # Collect error info
+                api_errors = result.get("api_errors", [])
+                if api_errors:
+                    for err in api_errors:
+                        # Extract error type for grouping
+                        error_messages[err] = error_messages.get(err, 0) + 1
+                    failed_files.append({
+                        "file": Path(result.get("file", "")).name,
+                        "errors": api_errors
+                    })
 
             # Don't store full transcript chunks in results
             result.pop("transcript_chunks", None)
@@ -591,12 +624,30 @@ def import_lifelogs(
 
     print()  # Newline after progress bar
 
+    # Print error summary if there were failures
+    if error_messages and not dry_run:
+        print("\n  Error Summary:")
+        # Group and show unique errors with counts
+        for error_msg, count in sorted(error_messages.items(), key=lambda x: -x[1]):
+            # Truncate long error messages
+            display_msg = error_msg[:80] + "..." if len(error_msg) > 80 else error_msg
+            print(f"    [{count}x] {display_msg}")
+
+        # Show first few failed files if verbose
+        if verbose and failed_files:
+            print("\n  Failed files (first 10):")
+            for ff in failed_files[:10]:
+                print(f"    - {ff['file']}")
+                for err in ff['errors'][:2]:
+                    print(f"        {err}")
+
     elapsed = time.time() - start_time
     results["imported"] = success_count + partial_count
     results["conversations_created"] = total_convos_created
     results["errors"] += fail_count
     results["elapsed_seconds"] = elapsed
-    
+    results["error_summary"] = error_messages
+
     return results
 
 
