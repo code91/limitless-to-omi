@@ -13,17 +13,47 @@ import requests
 import argparse
 import time
 import sys
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Tuple, List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Configuration via environment variables
 OMI_API_KEY = os.environ.get("OMI_API_KEY", "")
 OMI_API_BASE = "https://api.omi.me/v1/dev"
 
 # Rate limiting (Omi allows 100 requests/minute)
-REQUESTS_PER_MINUTE = 60
-DELAY_BETWEEN_REQUESTS = 60 / REQUESTS_PER_MINUTE
+OMI_REQUESTS_PER_MINUTE = 100
+OMI_MIN_DELAY = 60.0 / OMI_REQUESTS_PER_MINUTE  # 0.6 seconds between requests
+
+# Conversation limits
+OMI_MAX_CHARS = 90000  # Split before 100k limit for safety margin
+
+# Default parallel workers
+DEFAULT_WORKERS = 3
+
+
+class RateLimiter:
+    """Thread-safe rate limiter for API requests."""
+
+    def __init__(self, min_delay: float):
+        self._lock = threading.Lock()
+        self._last_request_time = 0.0
+        self._min_delay = min_delay
+
+    def wait(self):
+        """Wait if necessary to respect rate limits."""
+        with self._lock:
+            now = time.time()
+            elapsed = now - self._last_request_time
+            if elapsed < self._min_delay:
+                time.sleep(self._min_delay - elapsed)
+            self._last_request_time = time.time()
+
+
+# Global rate limiter instance
+_rate_limiter = RateLimiter(OMI_MIN_DELAY)
 
 
 def parse_filename(filename: str) -> Tuple[Optional[datetime], str]:
@@ -111,6 +141,75 @@ def extract_transcript(content: str) -> str:
     return '\n'.join(transcript_lines)
 
 
+def split_transcript(transcript: str, max_chars: int = OMI_MAX_CHARS) -> List[str]:
+    """
+    Split a large transcript into chunks that fit within Omi's limits.
+
+    Splits at line boundaries to preserve conversation flow.
+
+    Args:
+        transcript: The full transcript text
+        max_chars: Maximum characters per chunk (default: 90000)
+
+    Returns:
+        List of transcript chunks
+    """
+    if len(transcript) <= max_chars:
+        return [transcript]
+
+    chunks = []
+    lines = transcript.split('\n')
+    current_chunk = []
+    current_length = 0
+
+    for line in lines:
+        line_length = len(line) + 1  # +1 for newline
+
+        # If single line exceeds max, split it
+        if line_length > max_chars:
+            # Save current chunk first
+            if current_chunk:
+                chunks.append('\n'.join(current_chunk))
+                current_chunk = []
+                current_length = 0
+
+            # Split long line by sentences or at max_chars
+            remaining = line
+            while len(remaining) > max_chars:
+                # Try to split at sentence boundary
+                split_point = remaining[:max_chars].rfind('. ')
+                if split_point < max_chars // 2:
+                    # No good sentence boundary, split at space
+                    split_point = remaining[:max_chars].rfind(' ')
+                if split_point < max_chars // 2:
+                    # No good space, hard split
+                    split_point = max_chars - 1
+
+                chunks.append(remaining[:split_point + 1])
+                remaining = remaining[split_point + 1:].lstrip()
+
+            if remaining:
+                current_chunk = [remaining]
+                current_length = len(remaining)
+            continue
+
+        # Check if adding this line would exceed limit
+        if current_length + line_length > max_chars:
+            # Save current chunk and start new one
+            chunks.append('\n'.join(current_chunk))
+            current_chunk = [line]
+            current_length = line_length
+        else:
+            current_chunk.append(line)
+            current_length += line_length
+
+    # Don't forget the last chunk
+    if current_chunk:
+        chunks.append('\n'.join(current_chunk))
+
+    return chunks
+
+
 def ms_to_iso(ms: int) -> str:
     """Convert milliseconds timestamp to ISO 8601 format with Z suffix."""
     dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
@@ -122,52 +221,62 @@ def create_omi_conversation(
     started_at: Optional[str] = None,
     finished_at: Optional[str] = None,
     language: str = "en",
-    source_file: str = ""
+    source_file: str = "",
+    part_info: Optional[Tuple[int, int]] = None
 ) -> Dict[str, Any]:
     """
     Create a conversation in Omi via the Developer API.
-    
+
     Args:
         text: The transcript text
         started_at: ISO 8601 timestamp when conversation started
         finished_at: ISO 8601 timestamp when conversation ended
         language: Language code (default: "en")
         source_file: Original filename for reference
-    
+        part_info: Optional tuple of (part_number, total_parts) for split conversations
+
     Returns:
         API response dict or error dict
     """
     if not OMI_API_KEY:
         return {"error": "OMI_API_KEY environment variable not set"}
-    
+
+    # Thread-safe rate limiting
+    _rate_limiter.wait()
+
     payload = {
         "text": text,
         "text_source": "other_text",
         "text_source_spec": "limitless_import",
         "language": language
     }
-    
+
     if started_at:
         payload["started_at"] = started_at
     if finished_at:
         payload["finished_at"] = finished_at
-    
+
     headers = {
         "Authorization": f"Bearer {OMI_API_KEY}",
         "Content-Type": "application/json"
     }
-    
+
     url = f"{OMI_API_BASE}/user/conversations"
-    
+
     try:
         response = requests.post(url, json=payload, headers=headers, timeout=30)
-        
+
         if response.status_code == 429:
-            return {"error": "Rate limited. Please wait and try again."}
-        
+            # Back off and retry once on rate limit
+            time.sleep(2)
+            _rate_limiter.wait()
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            if response.status_code == 429:
+                return {"error": "Rate limited. Please wait and try again."}
+
         response.raise_for_status()
         return response.json()
-        
+
     except requests.exceptions.Timeout:
         return {"error": "Request timed out"}
     except requests.exceptions.RequestException as e:
@@ -209,25 +318,25 @@ def process_file(filepath: Path) -> Dict[str, Any]:
     
     # Extract transcript
     transcript = extract_transcript(content)
-    
+
     if not transcript.strip():
         return {
             "file": str(filepath),
             "skipped": True,
             "reason": "empty transcript"
         }
-    
-    # Truncate if too long (Omi limit is 100,000 chars)
-    if len(transcript) > 100000:
-        transcript = transcript[:100000]
-    
+
+    # Split large transcripts into chunks
+    chunks = split_transcript(transcript)
+
     return {
         "file": str(filepath),
         "title": title,
         "started_at": started_at,
         "finished_at": finished_at,
         "transcript_length": len(transcript),
-        "transcript": transcript
+        "transcript_chunks": chunks,
+        "num_parts": len(chunks)
     }
 
 
@@ -241,6 +350,74 @@ def find_markdown_files(directory: Path) -> List[Path]:
     return sorted(directory.rglob('*.md'))
 
 
+def _import_single_file(
+    processed: Dict[str, Any],
+    dry_run: bool,
+    verbose: bool
+) -> Dict[str, Any]:
+    """
+    Import a single processed file to Omi. Used by parallel executor.
+
+    Args:
+        processed: Processed file dict with transcript_chunks
+        dry_run: If True, don't actually create conversations
+        verbose: Print detailed progress
+
+    Returns:
+        Updated processed dict with results
+    """
+    if dry_run:
+        processed["status"] = "would_import"
+        processed["conversations_created"] = processed.get("num_parts", 1)
+        return processed
+
+    chunks = processed.get("transcript_chunks", [])
+    num_parts = len(chunks)
+    conversation_ids = []
+    errors = []
+
+    for i, chunk in enumerate(chunks):
+        part_info = (i + 1, num_parts) if num_parts > 1 else None
+
+        api_result = create_omi_conversation(
+            text=chunk,
+            started_at=processed.get("started_at"),
+            finished_at=processed.get("finished_at"),
+            language="en",
+            source_file=processed.get("file", ""),
+            part_info=part_info
+        )
+
+        if api_result.get("error"):
+            errors.append(f"Part {i+1}: {api_result['error']}")
+        else:
+            conversation_ids.append(api_result.get("id"))
+
+    # Update processed dict with results
+    processed["conversation_ids"] = conversation_ids
+    processed["conversations_created"] = len(conversation_ids)
+
+    if errors:
+        processed["api_errors"] = errors
+        if conversation_ids:
+            processed["status"] = "partial"
+        else:
+            processed["status"] = "failed"
+    else:
+        processed["status"] = "success"
+
+    return processed
+
+
+def print_progress(current: int, total: int, status: str = "", width: int = 40):
+    """Print a progress bar to stderr."""
+    percent = current / total if total > 0 else 0
+    filled = int(width * percent)
+    bar = "█" * filled + "░" * (width - filled)
+    sys.stderr.write(f"\r  Progress: |{bar}| {current}/{total} {status}")
+    sys.stderr.flush()
+
+
 def import_lifelogs(
     lifelogs_dir: str,
     dry_run: bool = True,
@@ -248,11 +425,12 @@ def import_lifelogs(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     chronological: bool = False,
-    verbose: bool = False
+    verbose: bool = False,
+    workers: int = DEFAULT_WORKERS
 ) -> Dict[str, Any]:
     """
     Import all lifelogs from the directory structure.
-    
+
     Args:
         lifelogs_dir: Path to the lifelogs folder
         dry_run: If True, don't actually create conversations
@@ -261,38 +439,25 @@ def import_lifelogs(
         end_date: Only process files up to this date (YYYY-MM-DD)
         chronological: Import oldest files first (recommended)
         verbose: Print detailed progress
-    
+        workers: Number of parallel workers (default: 3)
+
     Returns:
         Summary dict with results
     """
     lifelogs_path = Path(lifelogs_dir)
-    
+
     if not lifelogs_path.exists():
         return {"error": f"Directory not found: {lifelogs_dir}"}
-    
+
     md_files = find_markdown_files(lifelogs_path)
-    
+
     # Reverse for chronological order (oldest first)
     if chronological:
         md_files = list(reversed(md_files))
-    
-    print(f"Found {len(md_files)} markdown files")
-    
-    results = {
-        "total_found": len(md_files),
-        "processed": 0,
-        "imported": 0,
-        "skipped": 0,
-        "errors": 0,
-        "details": []
-    }
-    
+
+    # Apply date filtering
+    filtered_files = []
     for filepath in md_files:
-        # Check limit
-        if limit and results["processed"] >= limit:
-            break
-        
-        # Date filtering based on filename
         if start_date or end_date:
             file_dt, _ = parse_filename(filepath.name)
             if file_dt:
@@ -301,58 +466,136 @@ def import_lifelogs(
                     continue
                 if end_date and file_date > end_date:
                     continue
-        
-        results["processed"] += 1
-        
-        # Process file
+        filtered_files.append(filepath)
+
+    # Apply limit
+    if limit:
+        filtered_files = filtered_files[:limit]
+
+    print(f"Found {len(md_files)} markdown files, {len(filtered_files)} after filtering")
+
+    results = {
+        "total_found": len(md_files),
+        "files_to_process": len(filtered_files),
+        "processed": 0,
+        "imported": 0,
+        "conversations_created": 0,
+        "skipped": 0,
+        "errors": 0,
+        "details": []
+    }
+
+    if not filtered_files:
+        return results
+
+    # Phase 1: Process all files (extract transcripts, split if needed)
+    print("\nPhase 1: Processing files...")
+    processed_files = []
+    skipped_count = 0
+    error_count = 0
+    total_conversations = 0
+
+    for i, filepath in enumerate(filtered_files):
+        if verbose:
+            print(f"  [{i+1}/{len(filtered_files)}] {filepath.name}")
+
         processed = process_file(filepath)
-        
+
         if processed.get("error"):
-            results["errors"] += 1
-            print(f"[{results['processed']}] ERROR: {filepath.name}")
+            error_count += 1
             if verbose:
-                print(f"    {processed['error']}")
+                print(f"    ERROR: {processed['error']}")
             results["details"].append(processed)
             continue
-        
+
         if processed.get("skipped"):
-            results["skipped"] += 1
+            skipped_count += 1
             if verbose:
-                print(f"[{results['processed']}] SKIP: {filepath.name} ({processed.get('reason')})")
+                print(f"    SKIP: {processed.get('reason')}")
             results["details"].append(processed)
             continue
-        
-        print(f"[{results['processed']}] {filepath.name} ({processed['transcript_length']} chars)")
-        
-        # Import to Omi
-        if not dry_run:
-            api_result = create_omi_conversation(
-                text=processed["transcript"],
-                started_at=processed.get("started_at"),
-                finished_at=processed.get("finished_at"),
-                language="en",
-                source_file=filepath.name
-            )
-            
-            if api_result.get("error"):
-                results["errors"] += 1
-                processed["api_error"] = api_result["error"]
-                print(f"    API ERROR: {api_result['error']}")
+
+        processed_files.append(processed)
+        total_conversations += processed.get("num_parts", 1)
+
+        if processed.get("num_parts", 1) > 1:
+            print(f"  [{i+1}] {filepath.name} ({processed['transcript_length']} chars) -> {processed['num_parts']} parts")
+        elif not verbose:
+            print_progress(i + 1, len(filtered_files))
+
+    if not verbose:
+        print()  # Newline after progress bar
+
+    results["processed"] = len(filtered_files)
+    results["skipped"] = skipped_count
+    results["errors"] = error_count
+
+    print(f"\n  Files to import: {len(processed_files)}")
+    print(f"  Total conversations to create: {total_conversations}")
+    if skipped_count:
+        print(f"  Skipped (empty): {skipped_count}")
+    if error_count:
+        print(f"  Errors: {error_count}")
+
+    if not processed_files:
+        return results
+
+    # Estimate time
+    if not dry_run:
+        est_seconds = total_conversations * OMI_MIN_DELAY
+        print(f"  Estimated time: {est_seconds/60:.1f} minutes (with {workers} workers)")
+
+    # Phase 2: Import to Omi (parallel)
+    print(f"\nPhase 2: {'Simulating import (dry run)' if dry_run else f'Importing to Omi ({workers} workers)'}...")
+
+    completed = 0
+    success_count = 0
+    partial_count = 0
+    fail_count = 0
+    total_convos_created = 0
+    start_time = time.time()
+
+    # Use ThreadPoolExecutor for parallel imports
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        # Submit all tasks
+        future_to_file = {
+            executor.submit(_import_single_file, pf, dry_run, verbose): pf
+            for pf in processed_files
+        }
+
+        # Process completed tasks
+        for future in as_completed(future_to_file):
+            completed += 1
+            result = future.result()
+
+            status = result.get("status", "unknown")
+            convos = result.get("conversations_created", 0)
+            total_convos_created += convos
+
+            if status == "success" or status == "would_import":
+                success_count += 1
+                status_char = "✓" if convos == 1 else f"✓({convos})"
+            elif status == "partial":
+                partial_count += 1
+                status_char = f"~({convos})"
             else:
-                results["imported"] += 1
-                processed["conversation_id"] = api_result.get("id")
-                if verbose:
-                    print(f"    Created: {api_result.get('id')}")
-            
-            # Rate limiting
-            time.sleep(DELAY_BETWEEN_REQUESTS)
-        else:
-            # Dry run - count as would-be-imported
-            results["imported"] += 1
-        
-        # Don't store full transcript in results (too large)
-        processed.pop("transcript", None)
-        results["details"].append(processed)
+                fail_count += 1
+                status_char = "✗"
+
+            # Don't store full transcript chunks in results
+            result.pop("transcript_chunks", None)
+            results["details"].append(result)
+
+            title = Path(result.get("file", "")).name[:30]
+            print_progress(completed, len(processed_files), f"{status_char} {title}")
+
+    print()  # Newline after progress bar
+
+    elapsed = time.time() - start_time
+    results["imported"] = success_count + partial_count
+    results["conversations_created"] = total_convos_created
+    results["errors"] += fail_count
+    results["elapsed_seconds"] = elapsed
     
     return results
 
@@ -375,6 +618,9 @@ Examples:
   # Import only files from a specific date range
   python limitless_to_omi.py /path/to/lifelogs --execute --start-date 2025-01-01 --end-date 2025-06-30
 
+  # Import with more parallel workers (faster but more API load)
+  python limitless_to_omi.py /path/to/lifelogs --execute --workers 5
+
 Environment:
   OMI_API_KEY    Your Omi Developer API key (required)
                  Get it from: Omi App > Settings > Developer > Create Key
@@ -394,9 +640,11 @@ Environment:
                         help='Only import files up to this date (YYYY-MM-DD)')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Show detailed progress')
+    parser.add_argument('--workers', '-w', type=int, default=DEFAULT_WORKERS,
+                        help=f'Number of parallel workers (default: {DEFAULT_WORKERS})')
     parser.add_argument('--output', '-o',
                         help='Save results to JSON file')
-    
+
     args = parser.parse_args()
     
     # Check API key
@@ -441,7 +689,8 @@ Environment:
         start_date=args.start_date,
         end_date=args.end_date,
         chronological=args.chronological,
-        verbose=args.verbose
+        verbose=args.verbose,
+        workers=args.workers
     )
     
     # Check for error
@@ -454,11 +703,15 @@ Environment:
     print("=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"Total files found:    {results['total_found']}")
-    print(f"Files processed:      {results['processed']}")
-    print(f"Successfully imported:{results['imported']}" + (" (would import)" if dry_run else ""))
-    print(f"Skipped (empty):      {results['skipped']}")
-    print(f"Errors:               {results['errors']}")
+    print(f"Total files found:      {results['total_found']}")
+    print(f"Files processed:        {results['processed']}")
+    print(f"Files imported:         {results['imported']}" + (" (would import)" if dry_run else ""))
+    print(f"Conversations created:  {results.get('conversations_created', results['imported'])}" + (" (would create)" if dry_run else ""))
+    print(f"Skipped (empty):        {results['skipped']}")
+    print(f"Errors:                 {results['errors']}")
+    if results.get('elapsed_seconds'):
+        elapsed = results['elapsed_seconds']
+        print(f"Time elapsed:           {elapsed/60:.1f} minutes ({elapsed:.1f}s)")
     
     # Save results
     if args.output:
